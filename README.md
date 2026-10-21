@@ -97,6 +97,7 @@ make stall         # el experimento con 1, 2 y todos los workers
 | Qué | Estado |
 |---|---|
 | zlib, gzip, comparación, fibras | **16 tests** en VM y nativo (raylang 1.27.65, macOS) |
+| macOS en CI | tests en VM y nativo; el binario sin `--release`, que en el runner `macos-14` no compila (#216) |
 | Linux | en CI (el binario nativo necesita `zlib1g-dev` al compilar, #215) |
 | Windows | solo `ray check`: no trae zlib, y un `extern` no puede llamarla `zlib1.dll` solo allí (#212, #215) |
 
@@ -125,6 +126,8 @@ En `findings/open/rayffi-1.27.65.md` del directorio de las apps:
    `-l<nombre>` al compilar: necesita la biblioteca de desarrollo y solo vale el nombre corto. No
    hay nombre por plataforma, y en la VM una biblioteca que falta se descubre en la primera llamada,
    con un pánico que habla del símbolo.
+8. **#216 [B]** `ray build --native --release` compila para la CPU de la máquina. En el runner
+   `macos-14` de GitHub eso rompe el crate `ring` del runtime, y el binario no se construye.
 
 Además, `llms.txt` no tiene sección de FFI: la superficie entera es §13 de la referencia y una
 función en `std/ffi`.
