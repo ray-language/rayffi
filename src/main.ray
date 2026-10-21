@@ -1,0 +1,259 @@
+//! rayffi: zlib from raylang through the FFI, and side by side with the stdlib.
+
+import std/fs;
+import std/time;
+import std/crypto;
+import zlib;
+import gz;
+import compare;
+import stall;
+
+const USAGE: string = `rayffi — zlib through raylang's FFI
+
+usage:
+  rayffi version                       the zlib this program loaded
+  rayffi gzip FILE [-o OUT] [-1..-9]   compress FILE to FILE.gz (zlib's gz* API, streaming)
+  rayffi gunzip FILE.gz [-o OUT]       decompress (a plain file passes through)
+  rayffi crc FILE...                   CRC-32 and Adler-32 of each file
+  rayffi compare [FILE] [-l LEVEL]     zlib against std/deflate and std/inflate on FILE
+                                       (or on 8 MiB of generated text): each must read the other
+  rayffi stall [-f FIBERS] [-m MIB]    what 'extern … blocking' buys: a ticker fiber's longest
+                                       gap while the fibers compress, both ways
+`;
+
+fn fail(msg: string) -> int {
+    eprint("rayffi: ${msg}");
+    1
+}
+
+fn option(a: [string], name: string) -> Option<string> {
+    for i in 0..a.len() {
+        if (a[i] == name && i + 1 < a.len()) {
+            return Option.Some(a[i + 1]);
+        }
+    }
+    Option.None
+}
+
+/// The arguments that are not options or option values.
+fn positional(a: [string], with_value: [string]) -> [string] {
+    var out: [string] = [];
+    var i = 0;
+    while (i < a.len()) {
+        if (with_value.contains(a[i])) {
+            i = i + 2;
+        } else {
+            if (!a[i].starts_with("-")) {
+                out.push(a[i]);
+            }
+            i = i + 1;
+        }
+    }
+    out
+}
+
+// A named wrapper: `parse_int` itself as a value does not compile to native (finding #213).
+fn number(s: string) -> Option<int> {
+    parse_int(s)
+}
+
+fn level_flag(a: [string]) -> int {
+    var level = 6;
+    for x in a {
+        if (x.len() == 2 && x.starts_with("-")) {
+            match (parse_int(x.substring(1, 2))) {
+                Option.Some(n) => level = n,
+                Option.None => { },
+            }
+        }
+    }
+    level
+}
+
+fn cmd_gzip(a: [string]) -> int {
+    let files = positional(a, ["-o"]);
+    if (files.len() != 1) {
+        return fail("gzip takes one FILE");
+    }
+    let src = files[0];
+    let dst = option(a, "-o").unwrap_or("${src}.gz");
+    let level = level_flag(a);
+    let t0 = time.now();
+    match (gz.pipe(src, "rb", dst, "wb${level}")) {
+        Result.Ok(n) => {
+            let out = fs.read_file_bytes(dst).map(fn(b: bytes) -> int { b.len() }).unwrap_or(0);
+            print("${src} → ${dst}: ${n} → ${out} octets in ${time.now() - t0} ms");
+            0
+        },
+        Result.Err(e) => fail(e),
+    }
+}
+
+fn cmd_gunzip(a: [string]) -> int {
+    let files = positional(a, ["-o"]);
+    if (files.len() != 1) {
+        return fail("gunzip takes one FILE");
+    }
+    let src = files[0];
+    let dst = match (option(a, "-o")) {
+        Option.Some(o) => o,
+        Option.None => match (src.strip_suffix(".gz")) {
+            Option.Some(base) => base,
+            Option.None => return fail("${src}: no .gz suffix; say where with -o"),
+        },
+    };
+    let t0 = time.now();
+    // "wbT": zlib's transparent write, a plain file.
+    match (gz.pipe(src, "rb", dst, "wbT")) {
+        Result.Ok(n) => {
+            print("${src} → ${dst}: ${n} octets in ${time.now() - t0} ms");
+            0
+        },
+        Result.Err(e) => fail(e),
+    }
+}
+
+fn hex8(n: int) -> string {
+    let digits = "0123456789abcdef";
+    var s = "";
+    for i in 0..8 {
+        s = s + to_string(digits[(n >> (28 - 4 * i)) & 15]);
+    }
+    s
+}
+
+fn cmd_crc(a: [string]) -> int {
+    let files = positional(a, []);
+    if (files.len() == 0) {
+        return fail("crc takes at least one FILE");
+    }
+    var status = 0;
+    for f in files {
+        // Chunk by chunk through gz* in plain mode: big files never sit whole in memory.
+        match (gz.open(f, "rb")) {
+            Result.Ok(h) => {
+                var crc = 0;
+                var adler = 1;
+                var n = 0;
+                var bad = "";
+                while (true) {
+                    match (gz.read(h, gz.CHUNK)) {
+                        Result.Ok(chunk) => {
+                            if (chunk.len() == 0) {
+                                break;
+                            }
+                            crc = zlib.crc32_update(crc, chunk);
+                            adler = zlib.adler32_update(adler, chunk);
+                            n = n + chunk.len();
+                        },
+                        Result.Err(e) => {
+                            bad = e;
+                            break;
+                        },
+                    }
+                }
+                // gzdirect before gzclose: after the close the handle is freed memory.
+                let plain = gz.is_plain(h);
+                gz.close(h);
+                if (bad != "") {
+                    status = fail(bad);
+                } else {
+                    let what = if (plain) { "" } else { "  (decompressed)" };
+                    print("crc32 ${hex8(crc)}  adler32 ${hex8(adler)}  ${n}  ${f}${what}");
+                }
+            },
+            Result.Err(e) => status = fail(e),
+        }
+    }
+    status
+}
+
+/// 8 MiB of text-like data: repetitive enough to compress, varied enough to make zlib work.
+fn sample() -> bytes {
+    let words = [
+        "fiber",
+        "worker",
+        "pointer",
+        "buffer",
+        "zlib",
+        "deflate",
+        "window",
+        "huffman",
+        "raylang",
+        "extern"
+    ];
+    var parts: [string] = [];
+    var total = 0;
+    var x = 12345;
+    while (total < 8 * 1024 * 1024) {
+        x = (x * 1103515245 + 12345) % 2147483648;
+        let w = words[(x >> 16) % words.len()];
+        let piece = if ((x >> 8) % 7 == 0) { "${w} ${x % 1000}\n" } else { "${w} " };
+        parts.push(piece);
+        total = total + piece.len();
+    }
+    parts.join("").to_bytes()
+}
+
+fn cmd_compare(a: [string]) -> int {
+    let files = positional(a, ["-l"]);
+    let level = option(a, "-l").and_then(number).unwrap_or(6);
+    let data = if (files.len() > 0) {
+        match (fs.read_file_bytes(files[0])) {
+            Result.Ok(b) => b,
+            Result.Err(e) => return fail("${files[0]}: ${e}"),
+        }
+    } else {
+        sample()
+    };
+    let tmp = match (fs.make_temp_dir("rayffi")) {
+        Result.Ok(d) => d,
+        Result.Err(e) => return fail(e),
+    };
+    print("zlib ${zlib.version()}, ${data.len()} octets, level ${level}\n");
+    let rows = compare.run(data, level, tmp);
+    fs.remove_all(tmp);
+    print(compare.render(rows));
+    if (compare.all_ok(rows)) { 0 } else { 1 }
+}
+
+fn cmd_stall(a: [string]) -> int {
+    let fibers = option(a, "-f").and_then(number).unwrap_or(8);
+    let mib = option(a, "-m").and_then(number).unwrap_or(8);
+    print(
+        "${fibers} fibers each compress ${mib} MiB of random octets; a ticker fiber wants every 1 ms:"
+    );
+    let plain = stall.run(false, fibers, mib * 1024 * 1024);
+    print(stall.render(plain));
+    let pooled = stall.run(true, fibers, mib * 1024 * 1024);
+    print(stall.render(pooled));
+    if (plain.ok && pooled.ok) { 0 } else { 1 }
+}
+
+fn main() -> int {
+    let a = args();
+    if (a.len() == 0) {
+        print(USAGE);
+        return 2;
+    }
+    let rest = a.slice(1, a.len());
+    match (a[0]) {
+        "version" => {
+            print("zlib ${zlib.version()}");
+            0
+        },
+        "gzip" => cmd_gzip(rest),
+        "gunzip" => cmd_gunzip(rest),
+        "crc" => cmd_crc(rest),
+        "compare" => cmd_compare(rest),
+        "stall" => cmd_stall(rest),
+        "help" => {
+            print(USAGE);
+            0
+        },
+        _ => {
+            eprint(USAGE);
+            2
+        },
+    }
+}

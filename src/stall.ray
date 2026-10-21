@@ -1,0 +1,113 @@
+//! What `blocking` buys: N fibers each compress a buffer with zlib while a ticker fiber tries to
+//! tick every millisecond. With a plain extern the C call holds its worker, and the fibers that
+//! share that worker (the ticker among them) wait; with `extern … blocking` the call goes to the
+//! blocking pool and the fiber parks.
+//!
+//! The two sides call different symbols, `compress` and `compress2`, because one C function
+//! cannot be declared both ways: extern names are global to the program (finding #212).
+
+import std/time;
+import std/crypto;
+import zlib;
+
+extern "z" {
+    fn compress(dest: bytes, dest_len: bytes, src: bytes, src_len: int) -> int;
+}
+
+pub struct Report {
+    blocking: bool,
+    fibers: int,
+    workers: int,
+    total_ms: int,
+    worst_tick_ms: int,
+    ok: bool,
+}
+
+fn cell(n: int) -> bytes {
+    var a: [int] = [];
+    for i in 0..8 {
+        a.push((n >> (8 * i)) & 255);
+    }
+    bytes_of(a)
+}
+
+fn ticker(stop: Channel<int>, out: Channel<int>) {
+    var last = time.now();
+    var worst = 0;
+    var running = true;
+    while (running) {
+        // The gap is measured on the way out too: the stop may be what wakes it after a stall.
+        if (select_timeout([stop], 1).is_some()) {
+            running = false;
+        }
+        let t = time.now();
+        if (t - last > worst) {
+            worst = t - last;
+        }
+        last = t;
+    }
+    send(out, worst);
+}
+
+fn work(blocking: bool, size: int, ready: Channel<int>, go: Channel<int>, done: Channel<bool>) {
+    // Incompressible input: zlib has to work for it.
+    let src = crypto.random_bytes(size);
+    let cap = zlib.bound(size);
+    let dest = zlib.zeros(cap);
+    let len = cell(cap);
+    send(ready, 1);
+    recv(go);
+    let ok = if (blocking) {
+        // zlib.compress → compress2, declared blocking.
+        zlib.compress(src, 6).is_ok()
+    } else {
+        compress(dest, len, src, size) == zlib.Z_OK
+    };
+    send(done, ok);
+}
+
+/// Runs the experiment once. Everything is prepared before the ticker starts, so it only sees
+/// the C calls.
+pub fn run(blocking: bool, fibers: int, size: int) -> Report {
+    let stop: Channel<int> = Channel.new();
+    let worst: Channel<int> = Channel.new();
+    let done: Channel<bool> = Channel.new();
+    let ready: Channel<int> = Channel.new();
+    let go: Channel<int> = Channel.new();
+    for i in 0..fibers {
+        spawn(fn() {
+            work(blocking, size, ready, go, done);
+        });
+    }
+    for i in 0..fibers {
+        recv(ready);
+    }
+    spawn(fn() {
+        ticker(stop, worst);
+    });
+    time.sleep(20);
+    let t0 = time.now();
+    for i in 0..fibers {
+        send(go, 1);
+    }
+    var ok = true;
+    for i in 0..fibers {
+        ok = ok && recv(done).unwrap_or(false);
+    }
+    let total = time.now() - t0;
+    send(stop, 1);
+    Report {
+        blocking: blocking,
+        fibers: fibers,
+        workers: worker_count(),
+        total_ms: total,
+        worst_tick_ms: recv(worst).unwrap_or(-1),
+        ok: ok
+    }
+}
+
+pub fn render(r: Report) -> string {
+    let kind = if (r.blocking) { "extern blocking" } else { "extern        " };
+    let status = if (r.ok) { "" } else { "  (a compression failed)" };
+    "${kind}  ${r.fibers} fibers on ${r.workers} workers: ${r.total_ms} ms in all, longest tick gap ${r.worst_tick_ms} ms${status}"
+}

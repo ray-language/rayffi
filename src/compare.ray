@@ -1,0 +1,140 @@
+//! zlib (through the FFI) against the stdlib's `std/deflate` and `std/inflate` on the same data:
+//! each side must read what the other writes, and the timings say what the FFI buys.
+
+import std/deflate;
+import std/inflate;
+import std/time;
+import std/fs;
+import zlib;
+import gz;
+
+pub struct Row {
+    what: string,
+    ms: int,
+    size: int,
+    ok: bool,
+    note: string,
+}
+
+fn row(what: string, t0: int, size: int, ok: bool, note: string) -> Row {
+    Row { what: what, ms: time.now() - t0, size: size, ok: ok, note: note }
+}
+
+fn same(a: bytes, b: bytes) -> bool {
+    a.len() == b.len() && a == b
+}
+
+/// Every pair on `data`; `tmp` is a scratch directory for the gzip files.
+pub fn run(data: bytes, level: int, tmp: string) -> [Row] {
+    var rows: [Row] = [];
+
+    var t0 = time.now();
+    let c1 = zlib.crc32_of(data);
+    rows.push(row("crc32 zlib", t0, 4, true, "${c1}"));
+    t0 = time.now();
+    let c2 = inflate.crc32(data);
+    rows.push(
+        row(
+            "crc32 std/inflate",
+            t0,
+            4,
+            c1 == c2,
+            if (c1 == c2) { "same" } else { "${c2} != ${c1}" }
+        )
+    );
+
+    t0 = time.now();
+    let zc = zlib.compress(data, level);
+    match (zc) {
+        Result.Ok(z) => {
+            rows.push(row("compress zlib (level ${level})", t0, z.len(), true, ""));
+            t0 = time.now();
+            match (inflate.zlib_inflate_limit(z, data.len() + 1)) {
+                Result.Ok(back) => rows.push(row("  → std/inflate", t0, back.len(), same(back, data), "")),
+                Result.Err(e) => rows.push(row("  → std/inflate", t0, 0, false, e)),
+            }
+            t0 = time.now();
+            match (zlib.uncompress_limit(z, data.len(), data.len() + 1)) {
+                Result.Ok(back) => rows.push(row("  → uncompress zlib", t0, back.len(), same(back, data), "")),
+                Result.Err(e) => rows.push(row("  → uncompress zlib", t0, 0, false, e)),
+            }
+        },
+        Result.Err(e) => rows.push(row("compress zlib", t0, 0, false, e)),
+    }
+
+    t0 = time.now();
+    let sc = deflate.zlib_compress(data);
+    rows.push(row("compress std/deflate", t0, sc.len(), true, ""));
+    t0 = time.now();
+    match (zlib.uncompress_limit(sc, data.len(), data.len() + 1)) {
+        Result.Ok(back) => rows.push(row("  → uncompress zlib", t0, back.len(), same(back, data), "")),
+        Result.Err(e) => rows.push(row("  → uncompress zlib", t0, 0, false, e)),
+    }
+    t0 = time.now();
+    match (inflate.zlib_inflate_limit(sc, data.len() + 1)) {
+        Result.Ok(back) => rows.push(row("  → std/inflate", t0, back.len(), same(back, data), "")),
+        Result.Err(e) => rows.push(row("  → std/inflate", t0, 0, false, e)),
+    }
+
+    // gzip files: zlib's gz* writes, std/inflate reads, and the other way round.
+    let plain = "${tmp}/data.bin";
+    let ours = "${tmp}/zlib.gz";
+    let theirs = "${tmp}/std.gz";
+    let back = "${tmp}/back.bin";
+    match (fs.write_file_bytes(plain, data)) {
+        Result.Ok(_) => { },
+        Result.Err(e) => {
+            rows.push(row("write ${plain}", time.now(), 0, false, e));
+            return rows;
+        },
+    }
+    t0 = time.now();
+    match (gz.pipe(plain, "rb", ours, "wb${if (level < 0) { 6 } else { level }}")) {
+        Result.Ok(_) => {
+            let file = fs.read_file_bytes(ours).unwrap_or(bytes_of([]));
+            rows.push(row("gzip file, zlib gz*", t0, file.len(), true, ""));
+            t0 = time.now();
+            match (inflate.gunzip_limit(file, data.len() + 1)) {
+                Result.Ok(out) => rows.push(row("  → std/inflate gunzip", t0, out.len(), same(out, data), "")),
+                Result.Err(e) => rows.push(row("  → std/inflate gunzip", t0, 0, false, e)),
+            }
+        },
+        Result.Err(e) => rows.push(row("gzip file, zlib gz*", t0, 0, false, e)),
+    }
+    t0 = time.now();
+    let sg = deflate.gzip_compress(data);
+    fs.write_file_bytes(theirs, sg);
+    rows.push(row("gzip file, std/deflate", t0, sg.len(), true, ""));
+    t0 = time.now();
+    match (gz.pipe(theirs, "rb", back, "wbT")) {
+        Result.Ok(n) => {
+            let out = fs.read_file_bytes(back).unwrap_or(bytes_of([]));
+            rows.push(row("  → zlib gz* read", t0, n, same(out, data), ""));
+        },
+        Result.Err(e) => rows.push(row("  → zlib gz* read", t0, 0, false, e)),
+    }
+    rows
+}
+
+fn pad(s: string, n: int) -> string {
+    if (s.len() >= n) { s } else { s + " ".repeat(n - s.len()) }
+}
+
+fn lpad(s: string, n: int) -> string {
+    if (s.len() >= n) { s } else { " ".repeat(n - s.len()) + s }
+}
+
+pub fn render(rows: [Row]) -> string {
+    var out = "${pad("", 32)}${lpad("ms", 7)}${lpad("octets", 12)}  ok\n";
+    for r in rows {
+        let mark = if (r.ok) { "yes" } else { "NO" };
+        let note = if (r.note == "") { "" } else { "  ${r.note}" };
+        out = out
+            + "${pad(r.what, 32)}${lpad(to_string(r.ms), 7)}${lpad(to_string(r.size), 12)}  ${mark}${note}\n";
+    }
+    out
+}
+
+pub fn all_ok(rows: [Row]) -> bool {
+    rows.filter(fn(r: Row) -> bool { !r.ok }).len() == 0
+}

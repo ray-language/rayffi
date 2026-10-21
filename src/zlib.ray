@@ -1,0 +1,155 @@
+//! zlib through the FFI: version, checksums and the one-shot `compress2` / `uncompress`.
+//!
+//! Sizes travel as `int`. zlib's `uLong` is 64 bits on macOS and Linux, and the reference lists
+//! `u64` for it, but the native backend rejects `u64` in an extern (finding #209). An `int`
+//! argument fills the whole register; an `int` return reads a C `int`, so a returned `uLong` keeps
+//! its low 32 bits, which is enough for a CRC and for buffers under 2 GiB.
+//!
+//! The `uLongf *` out-parameters are 8-octet `bytes` buffers that zlib writes into: the FFI passes
+//! a pointer to the buffer itself, not to a copy. Little-endian, so the same buffer also works
+//! where `uLong` is 32 bits (Windows).
+
+extern "z" {
+    fn zlibVersion() -> Option<string>;
+    fn crc32(crc: int, buf: bytes, len: int) -> int;
+    fn adler32(adler: int, buf: bytes, len: int) -> int;
+    fn compressBound(source_len: int) -> int;
+}
+
+// The one-shot calls run for as long as the input is big: they go to the blocking pool.
+extern "z" blocking {
+    fn compress2(dest: bytes, dest_len: bytes, src: bytes, src_len: int, level: int) -> int;
+    fn uncompress(dest: bytes, dest_len: bytes, src: bytes, src_len: int) -> int;
+}
+
+pub const Z_OK: int = 0;
+
+pub const Z_STREAM_END: int = 1;
+
+pub const Z_ERRNO: int = -1;
+
+pub const Z_STREAM_ERROR: int = -2;
+
+pub const Z_DATA_ERROR: int = -3;
+
+pub const Z_MEM_ERROR: int = -4;
+
+pub const Z_BUF_ERROR: int = -5;
+
+const MASK32: int = 0xFFFFFFFF;
+
+/// The zlib the program loaded, as zlib reports it ("1.2.12").
+pub fn version() -> string {
+    zlibVersion().unwrap_or("?")
+}
+
+/// zlib's name for a return code.
+pub fn describe(rc: int) -> string {
+    match (rc) {
+        0 => "Z_OK",
+        1 => "Z_STREAM_END",
+        -1 => "Z_ERRNO",
+        -2 => "Z_STREAM_ERROR",
+        -3 => "Z_DATA_ERROR (corrupt or not zlib)",
+        -4 => "Z_MEM_ERROR",
+        -5 => "Z_BUF_ERROR",
+        -6 => "Z_VERSION_ERROR",
+        _ => "zlib error ${rc}",
+    }
+}
+
+/// CRC-32 (the gzip/zip one) of `data`, continuing from `crc` (0 to start).
+pub fn crc32_update(crc: int, data: bytes) -> int {
+    crc32(crc, data, data.len()) & MASK32
+}
+
+pub fn crc32_of(data: bytes) -> int {
+    crc32_update(0, data)
+}
+
+/// Adler-32 (the zlib-format one) of `data`, continuing from `adler` (1 to start).
+pub fn adler32_update(adler: int, data: bytes) -> int {
+    adler32(adler, data, data.len()) & MASK32
+}
+
+pub fn adler32_of(data: bytes) -> int {
+    adler32_update(1, data)
+}
+
+/// The largest output `compress` can produce for `n` input octets.
+pub fn bound(n: int) -> int {
+    compressBound(n) & MASK32
+}
+
+/// A fresh buffer of `n` zero octets for C to write into. Fresh matters: on the VM, C writing
+/// into a `b"…"` literal changes the literal itself (finding #211).
+pub fn zeros(n: int) -> bytes {
+    var z = bytes_of([0]);
+    while (z.len() < n) {
+        z = z + z;
+    }
+    z.sub_bytes(0, n)
+}
+
+/// A `uLongf` cell holding `n`, little-endian.
+fn cell(n: int) -> bytes {
+    var a: [int] = [];
+    for i in 0..8 {
+        a.push((n >> (8 * i)) & 255);
+    }
+    bytes_of(a)
+}
+
+fn cell_value(b: bytes) -> int {
+    var n = 0;
+    for i in 0..8 {
+        n = n | (b[i] << (8 * i));
+    }
+    n
+}
+
+/// zlib-format compression of `data` at `level` (0–9, -1 = zlib's default, 6).
+pub fn compress(data: bytes, level: int) -> Result<bytes, string> {
+    if (level < -1 || level > 9) {
+        return Result.Err("compression level ${level} out of range (-1 to 9)");
+    }
+    let cap = bound(data.len());
+    let dest = zeros(cap);
+    let len = cell(cap);
+    let rc = compress2(dest, len, data, data.len(), level);
+    if (rc != Z_OK) {
+        return Result.Err("compress2: ${describe(rc)}");
+    }
+    Result.Ok(dest.sub_bytes(0, cell_value(len)))
+}
+
+/// Decompresses a zlib-format stream. `size_hint` is the expected size (0 if unknown); the
+/// buffer doubles while zlib says it is short, up to `max_out` octets.
+pub fn uncompress_limit(data: bytes, size_hint: int, max_out: int) -> Result<bytes, string> {
+    var cap = if (size_hint > 0) { size_hint } else { data.len() * 4 + 64 };
+    while (true) {
+        if (cap > max_out) {
+            cap = max_out;
+        }
+        let dest = zeros(cap);
+        let len = cell(cap);
+        let rc = uncompress(dest, len, data, data.len());
+        if (rc == Z_OK) {
+            return Result.Ok(dest.sub_bytes(0, cell_value(len)));
+        }
+        // Z_BUF_ERROR is also what a truncated stream gives once the buffer is big enough.
+        if (rc != Z_BUF_ERROR || cap >= max_out) {
+            if (rc == Z_BUF_ERROR && cap >= max_out) {
+                return Result.Err(
+                    "uncompress: output larger than ${max_out} octets, or the input is truncated"
+                );
+            }
+            return Result.Err("uncompress: ${describe(rc)}");
+        }
+        cap = cap * 2;
+    }
+}
+
+pub fn uncompress_all(data: bytes) -> Result<bytes, string> {
+    uncompress_limit(data, 0, 1 << 30)
+}

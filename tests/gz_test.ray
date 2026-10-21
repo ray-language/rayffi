@@ -1,0 +1,120 @@
+import std/fs;
+import std/ffi;
+import std/inflate;
+import std/deflate;
+import gz;
+
+fn text(n: int) -> bytes {
+    var parts: [string] = [];
+    for i in 0..n {
+        parts.push("record ${i}: some gzip payload\n");
+    }
+    parts.join("").to_bytes()
+}
+
+fn tmp() -> string {
+    fs.make_temp_dir("rayffi-test").unwrap()
+}
+
+fn read_all(path: string) -> bytes {
+    let f = gz.open(path, "rb").unwrap();
+    var parts: [bytes] = [];
+    while (true) {
+        let c = gz.read(f, 1000).unwrap();
+        if (c.len() == 0) {
+            break;
+        }
+        parts.push(c);
+    }
+    gz.close(f).unwrap();
+    bytes_concat(parts)
+}
+
+@test
+fn write_then_read_in_chunks() {
+    let dir = tmp();
+    let path = "${dir}/a.gz";
+    let data = text(5000);
+    let f = gz.open(path, "wb9").unwrap();
+    // Several writes, the last one shorter.
+    var at = 0;
+    while (at < data.len()) {
+        let end = if (at + 7000 < data.len()) { at + 7000 } else { data.len() };
+        assert_eq(gz.write(f, data.sub_bytes(at, end)).unwrap(), end - at);
+        at = end;
+    }
+    gz.close(f).unwrap();
+    let file = fs.read_file_bytes(path).unwrap();
+    assert_eq(file[0], 0x1F);
+    assert_eq(file[1], 0x8B);
+    assert(file.len() < data.len() / 4);
+    assert_eq(read_all(path), data);
+    // The stdlib reads what zlib wrote, and zlib what the stdlib wrote.
+    assert_eq(inflate.gunzip(file).unwrap(), data);
+    fs.write_file_bytes("${dir}/b.gz", deflate.gzip_compress(data)).unwrap();
+    assert_eq(read_all("${dir}/b.gz"), data);
+    fs.remove_all(dir);
+}
+
+@test
+fn a_plain_file_reads_through() {
+    let dir = tmp();
+    let path = "${dir}/plain.txt";
+    fs.write_file(path, "not compressed\n").unwrap();
+    let f = gz.open(path, "rb").unwrap();
+    assert_eq(from_utf8(gz.read(f, 100).unwrap()).unwrap(), "not compressed\n");
+    assert(gz.is_plain(f));
+    gz.close(f).unwrap();
+    fs.remove_all(dir);
+}
+
+@test
+fn pipe_compresses_and_back() {
+    let dir = tmp();
+    let data = text(20000);
+    fs.write_file_bytes("${dir}/in", data).unwrap();
+    assert_eq(gz.pipe("${dir}/in", "rb", "${dir}/in.gz", "wb6").unwrap(), data.len());
+    assert_eq(gz.pipe("${dir}/in.gz", "rb", "${dir}/out", "wbT").unwrap(), data.len());
+    assert_eq(fs.read_file_bytes("${dir}/out").unwrap(), data);
+    fs.remove_all(dir);
+}
+
+@test
+fn errors_are_values() {
+    let dir = tmp();
+    let missing = gz.open("${dir}/nope.gz", "rb");
+    match (missing) {
+        Result.Ok(_) => panic("opened a missing file"),
+        Result.Err(e) => assert(e.contains("no such file")),
+    }
+    // A corrupt gzip: the header is right, the rest is not.
+    fs.write_file_bytes("${dir}/bad.gz", bytes_of([0x1F, 0x8B, 8, 0, 0, 0, 0, 0, 0, 3, 0xFF, 0xFF, 0xFF, 0xFF]))
+        .unwrap();
+    let f = gz.open("${dir}/bad.gz", "rb").unwrap();
+    assert(gz.read(f, 100).is_err());
+    gz.close(f);
+    // Use after close is caught before it reaches zlib (the handle is freed memory by then).
+    let g = gz.open("${dir}/c.gz", "wb").unwrap();
+    gz.close(g).unwrap();
+    assert(gz.close(g).is_err());
+    assert(gz.write(g, "x".to_bytes()).is_err());
+    assert(!gz.is_plain(g));
+    fs.remove_all(dir);
+}
+
+@test
+fn errno_is_readable_or_says_why_not() {
+    // §13: `ffi.errno()` right after the failing call. In a native binary it is a stub that
+    // panics (finding #210); this test records which of the two happened.
+    let dir = tmp();
+    let r = try_call(fn() -> int {
+        gz.open("${dir}/missing.gz", "rb");
+        ffi.errno()
+    });
+    match (r) {
+        // gz.open makes more calls after gzopen (fs.exists), so only "set" is certain.
+        Result.Ok(e) => assert(e >= 0),
+        Result.Err(msg) => assert(msg.contains("not supported") || msg.contains("errno")),
+    }
+    fs.remove_all(dir);
+}

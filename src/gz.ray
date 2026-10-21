@@ -1,0 +1,145 @@
+//! gzip files through zlib's `gz*` API: an opaque `gzFile` handle (`ptr`), read and write in
+//! chunks. Every call that touches the disk is declared `blocking`: in a native binary the fiber
+//! parks while the pool thread waits for the disk, and its worker keeps running the others.
+
+import std/fs;
+import zlib;
+
+extern "z" blocking {
+    fn gzopen(path: string, mode: string) -> Option<ptr>;
+    fn gzread(file: ptr, buf: bytes, len: int) -> int;
+    fn gzwrite(file: ptr, buf: bytes, len: int) -> int;
+    fn gzclose(file: ptr) -> int;
+}
+
+extern "z" {
+    fn gzbuffer(file: ptr, size: int) -> int;
+    fn gzerror(file: ptr, errnum: bytes) -> Option<string>;
+    fn gzdirect(file: ptr) -> int;
+}
+
+/// An open gzip file. `ptr` is zlib's `gzFile`: raylang cannot look inside, only hand it back.
+pub struct GzFile {
+    handle: ptr,
+    path: string,
+    open: bool,
+}
+
+pub const CHUNK: int = 256 * 1024;
+
+/// Opens `path` with a zlib mode: `"rb"` reads (gzip or, transparently, a plain file), `"wb9"`
+/// writes gzip at level 9.
+pub fn open(path: string, mode: string) -> Result<GzFile, string> {
+    match (gzopen(path, mode)) {
+        Option.Some(h) => {
+            // A larger internal buffer: fewer, bigger reads and writes.
+            gzbuffer(h, CHUNK);
+            Result.Ok(GzFile { handle: h, path: path, open: true })
+        },
+        Option.None => {
+            // Not from errno: `ffi.errno()` does not exist in a native binary (finding #210), so
+            // the reason is asked of the file system.
+            let reading = mode.starts_with("r");
+            if (reading && !fs.exists(path)) {
+                Result.Err("${path}: no such file or directory")
+            } else {
+                if (reading && fs.is_dir(path)) {
+                    Result.Err("${path}: is a directory")
+                } else {
+                    Result.Err("${path}: cannot open (mode '${mode}')")
+                }
+            }
+        },
+    }
+}
+
+fn error_of(f: GzFile, what: string) -> string {
+    let code = bytes_of([0, 0, 0, 0]);
+    let msg = gzerror(f.handle, code).unwrap_or("");
+    "${f.path}: ${what}: ${msg}"
+}
+
+/// Up to `n` octets, decompressed; empty at the end of the file.
+pub fn read(f: GzFile, n: int) -> Result<bytes, string> {
+    if (!f.open) {
+        return Result.Err("${f.path}: read after close");
+    }
+    let buf = zlib.zeros(n);
+    let got = gzread(f.handle, buf, n);
+    if (got < 0) {
+        return Result.Err(error_of(f, "read"));
+    }
+    Result.Ok(buf.sub_bytes(0, got))
+}
+
+pub fn write(f: GzFile, data: bytes) -> Result<int, string> {
+    if (!f.open) {
+        return Result.Err("${f.path}: write after close");
+    }
+    if (data.len() == 0) {
+        return Result.Ok(0);
+    }
+    let put = gzwrite(f.handle, data, data.len());
+    if (put != data.len()) {
+        return Result.Err(error_of(f, "write"));
+    }
+    Result.Ok(put)
+}
+
+/// True if the file being read is not gzip and passes through as is.
+pub fn is_plain(f: GzFile) -> bool {
+    f.open && gzdirect(f.handle) == 1
+}
+
+/// Closes the file (and, when writing, flushes the gzip trailer). Closing twice is an error,
+/// not a double free: zlib frees the handle on the first close.
+pub fn close(f: GzFile) -> Result<int, string> {
+    if (!f.open) {
+        return Result.Err("${f.path}: already closed");
+    }
+    f.open = false;
+    let rc = gzclose(f.handle);
+    if (rc != 0) {
+        return Result.Err("${f.path}: close: zlib error ${rc}");
+    }
+    Result.Ok(0)
+}
+
+/// Streams `src` (gzip or plain) into `dst` with `mode`, chunk by chunk. Returns the octets read
+/// (decompressed) from `src`.
+pub fn pipe(src: string, src_mode: string, dst: string, dst_mode: string) -> Result<int, string> {
+    let input = open(src, src_mode)?;
+    let output = match (open(dst, dst_mode)) {
+        Result.Ok(o) => o,
+        Result.Err(e) => {
+            close(input);
+            return Result.Err(e);
+        },
+    };
+    var total = 0;
+    while (true) {
+        let chunk = match (read(input, CHUNK)) {
+            Result.Ok(c) => c,
+            Result.Err(e) => {
+                close(input);
+                close(output);
+                return Result.Err(e);
+            },
+        };
+        if (chunk.len() == 0) {
+            break;
+        }
+        total = total + chunk.len();
+        match (write(output, chunk)) {
+            Result.Ok(_) => { },
+            Result.Err(e) => {
+                close(input);
+                close(output);
+                return Result.Err(e);
+            },
+        }
+    }
+    close(input)?;
+    close(output)?;
+    Result.Ok(total)
+}

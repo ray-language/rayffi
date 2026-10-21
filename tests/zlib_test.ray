@@ -1,0 +1,112 @@
+import std/inflate;
+import std/deflate;
+import zlib;
+
+fn text(n: int) -> bytes {
+    var parts: [string] = [];
+    for i in 0..n {
+        parts.push("line ${i} of a test that repeats itself\n");
+    }
+    parts.join("").to_bytes()
+}
+
+@test
+fn version_is_reported() {
+    let v = zlib.version();
+    assert(v.starts_with("1."));
+}
+
+@test
+fn checksums_match_the_known_vectors() {
+    // "123456789" is the check string of both specs.
+    let check = "123456789".to_bytes();
+    assert_eq(zlib.crc32_of(check), 0xCBF43926);
+    assert_eq(zlib.adler32_of(check), 0x091E01DE);
+    assert_eq(zlib.crc32_of(bytes_of([])), 0);
+    assert_eq(zlib.adler32_of(bytes_of([])), 1);
+    // The high bit set: the C int return is masked back to an unsigned value.
+    assert_eq(zlib.crc32_of("hello".to_bytes()), 0x3610A686);
+}
+
+@test
+fn checksums_continue_across_chunks() {
+    let data = text(500);
+    let half = data.len() / 2;
+    let crc = zlib.crc32_update(
+        zlib.crc32_of(data.sub_bytes(0, half)),
+        data.sub_bytes(half, data.len())
+    );
+    assert_eq(crc, zlib.crc32_of(data));
+    let adler = zlib.adler32_update(
+        zlib.adler32_of(data.sub_bytes(0, half)),
+        data.sub_bytes(half, data.len())
+    );
+    assert_eq(adler, zlib.adler32_of(data));
+    assert_eq(zlib.crc32_of(data), inflate.crc32(data));
+}
+
+@test
+fn round_trip_at_every_level() {
+    let data = text(2000);
+    for level in [-1, 0, 1, 6, 9] {
+        let z = zlib.compress(data, level).unwrap();
+        assert(z.len() <= zlib.bound(data.len()));
+        assert_eq(zlib.uncompress_all(z).unwrap(), data);
+    }
+    assert(zlib.compress(data, 10).is_err());
+}
+
+@test
+fn the_buffer_grows_when_the_hint_is_short() {
+    let data = text(5000);
+    let z = zlib.compress(data, 9).unwrap();
+    // A 16-octet first guess: it doubles until the output fits.
+    assert_eq(zlib.uncompress_limit(z, 16, 1 << 26).unwrap(), data);
+    // But never past the cap.
+    let capped = zlib.uncompress_limit(z, 16, 1000);
+    assert(capped.is_err());
+}
+
+@test
+fn corrupt_input_is_an_error_not_a_crash() {
+    let data = text(100);
+    let z = zlib.compress(data, 6).unwrap();
+    // Not zlib at all.
+    match (zlib.uncompress_all("definitely not zlib".to_bytes())) {
+        Result.Ok(_) => panic("garbage decompressed"),
+        Result.Err(e) => assert(e.contains("Z_DATA_ERROR")),
+    }
+    // A flipped octet in the middle: the Adler-32 at the end catches it at worst.
+    var flipped: [int] = [];
+    for i in 0..z.len() {
+        flipped.push(if (i == z.len() / 2) { z[i] ^ 0x55 } else { z[i] });
+    }
+    assert(zlib.uncompress_all(bytes_of(flipped)).is_err());
+    // Truncated.
+    assert(zlib.uncompress_limit(z.sub_bytes(0, z.len() - 5), data.len(), 1 << 20).is_err());
+    // Empty.
+    assert(zlib.uncompress_all(bytes_of([])).is_err());
+}
+
+@test
+fn zlib_and_the_stdlib_read_each_other() {
+    let data = text(3000);
+    let ours = zlib.compress(data, 9).unwrap();
+    assert_eq(inflate.zlib_inflate(ours).unwrap(), data);
+    let theirs = deflate.zlib_compress(data);
+    assert_eq(zlib.uncompress_all(theirs).unwrap(), data);
+}
+
+@test
+fn the_out_buffer_is_written_in_place() {
+    // What the module relies on: C writes into the bytes buffer the program passed, so the
+    // program sees the result through its own value (and through any alias of it).
+    let data = text(10);
+    let z = zlib.compress(data, 6).unwrap();
+    assert_eq(z[0], 0x78);
+    // A fresh buffer each time, independent of the others.
+    let a = zlib.zeros(4);
+    let b = zlib.zeros(4);
+    assert_eq(a.len(), 4);
+    assert_eq(b[0], 0);
+}

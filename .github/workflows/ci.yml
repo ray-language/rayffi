@@ -1,0 +1,91 @@
+# rayffi CI: every pull request and every push to master checks the formatting and runs the
+# test suite on the VM and as native binaries, with the raylang release pinned in ray.toml
+# (.github/actions/setup-ray). rayffi binds the system zlib: Linux and macOS have it (the
+# native build links it, so Linux needs the zlib1g-dev headers and libz.so). Windows has no zlib
+# and an extern cannot name zlib1.dll there only (findings #212, #215): it is type-checked.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to the same PR supersedes the run in progress.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  format:
+    name: ray fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust and the pinned raylang
+        uses: ./.github/actions/setup-ray
+        with:
+          target: x86_64-unknown-linux-gnu
+      # `ray fmt` prints the canonical version: any difference is an unformatted file.
+      - name: Check that every source is formatted
+        shell: bash
+        run: |
+          status=0
+          for f in src/*.ray tests/*.ray; do
+            if ! ray fmt "$f" | diff -u "$f" - >/dev/null; then
+              echo "::error file=$f::not formatted (run: ray fmt -w $f)"
+              status=1
+            fi
+          done
+          exit $status
+
+  test:
+    name: test ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu }
+          - { os: macos-14,       target: aarch64-apple-darwin }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust and the pinned raylang
+        uses: ./.github/actions/setup-ray
+        with:
+          target: ${{ matrix.target }}
+      - name: zlib for the native link
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y zlib1g-dev
+      - name: Tests (VM)
+        run: ray test
+      - name: Tests (native)
+        run: ray test --native
+      - name: compare and stall, native
+        run: |
+          ray build --native --release -o rayffi src/main.ray
+          ./rayffi version
+          ./rayffi compare
+          RAYLANG_THREADS=2 ./rayffi stall
+
+  windows:
+    name: check x86_64-pc-windows-msvc
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust and the pinned raylang
+        uses: ./.github/actions/setup-ray
+        with:
+          target: x86_64-pc-windows-msvc
+      - name: Type-check
+        run: ray check
+      # What the VM says when the library is not there: recorded, not required.
+      - name: Run without zlib (expected to fail)
+        continue-on-error: true
+        run: ray run src/main.ray version

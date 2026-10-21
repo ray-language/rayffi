@@ -1,0 +1,64 @@
+import std/fs;
+import std/crypto;
+import zlib;
+import gz;
+import stall;
+
+@test
+fn many_fibers_call_zlib_at_once() {
+    // compress2 and uncompress are `blocking`: in native they run on the pool, in parallel.
+    let done: Channel<bool> = Channel.new();
+    for i in 0..8 {
+        spawn(fn() {
+            let data = crypto.random_bytes(200000 + i);
+            let z = zlib.compress(data, 1).unwrap();
+            let back = zlib.uncompress_limit(z, data.len(), data.len()).unwrap();
+            send(done, back == data && zlib.crc32_of(back) == zlib.crc32_of(data));
+        });
+    }
+    for i in 0..8 {
+        assert(recv(done).unwrap());
+    }
+}
+
+@test
+fn each_fiber_owns_its_handle() {
+    // The pattern that works everywhere: the fiber that uses a gzFile opens it. A ptr does not
+    // leave its fiber in a native binary, not through a channel and not captured by spawn,
+    // not even with spawn_local (finding #214); on the VM it would.
+    let dir = fs.make_temp_dir("rayffi-test").unwrap();
+    let done: Channel<int> = Channel.new();
+    for i in 0..4 {
+        spawn(fn() {
+            let path = "${dir}/part${i}.gz";
+            let f = gz.open(path, "wb").unwrap();
+            for k in 0..100 {
+                gz.write(f, "fiber ${i} line ${k}\n".to_bytes()).unwrap();
+            }
+            gz.close(f).unwrap();
+            send(done, i);
+        });
+    }
+    var seen = 0;
+    for i in 0..4 {
+        seen = seen + recv(done).unwrap();
+    }
+    assert_eq(seen, 0 + 1 + 2 + 3);
+    for i in 0..4 {
+        let r = gz.open("${dir}/part${i}.gz", "rb").unwrap();
+        let text = from_utf8(gz.read(r, 100000).unwrap()).unwrap();
+        gz.close(r).unwrap();
+        assert_eq(text.split("\n").len(), 101);
+        assert(text.starts_with("fiber ${i} line 0\n"));
+    }
+    fs.remove_all(dir);
+}
+
+@test
+fn the_stall_experiment_runs_both_ways() {
+    // Only that it works: the gaps depend on the machine and on the worker count.
+    let a = stall.run(false, 3, 100000);
+    let b = stall.run(true, 3, 100000);
+    assert(a.ok && b.ok);
+    assert(a.worst_tick_ms >= 0 && b.worst_tick_ms >= 0);
+}
