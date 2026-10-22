@@ -1,25 +1,24 @@
 //! zlib through the FFI: version, checksums and the one-shot `compress2` / `uncompress`.
 //!
-//! Sizes travel as `int`. zlib's `uLong` is 64 bits on macOS and Linux, and the reference lists
-//! `u64` for it, but the native backend rejects `u64` in an extern (finding #209). An `int`
-//! argument fills the whole register; an `int` return reads a C `int`, so a returned `uLong` keeps
-//! its low 32 bits, which is enough for a CRC and for buffers under 2 GiB.
+//! zlib's `uLong` is `u64` here (64 bits on macOS and Linux), converted with `as` at the edge.
 //!
-//! The `uLongf *` out-parameters are 8-octet `bytes` buffers that zlib writes into: the FFI passes
-//! a pointer to the buffer itself, not to a copy. Little-endian, so the same buffer also works
-//! where `uLong` is 32 bits (Windows).
+//! The `uLongf *` out-parameters are 8-octet `bytes` buffers (`ffi.buffer`) that zlib writes into:
+//! the FFI passes a pointer to the buffer itself, not to a copy. Little-endian, so the same buffer
+//! also works where `uLong` is 32 bits (Windows).
+
+import std/ffi;
 
 extern "z" {
     fn zlibVersion() -> Option<string>;
-    fn crc32(crc: int, buf: bytes, len: int) -> int;
-    fn adler32(adler: int, buf: bytes, len: int) -> int;
-    fn compressBound(source_len: int) -> int;
+    fn crc32(crc: u64, buf: bytes, len: u64) -> u64;
+    fn adler32(adler: u64, buf: bytes, len: u64) -> u64;
+    fn compressBound(source_len: u64) -> u64;
 }
 
 // The one-shot calls run for as long as the input is big: they go to the blocking pool.
 extern "z" blocking {
-    fn compress2(dest: bytes, dest_len: bytes, src: bytes, src_len: int, level: int) -> int;
-    fn uncompress(dest: bytes, dest_len: bytes, src: bytes, src_len: int) -> int;
+    fn compress2(dest: bytes, dest_len: bytes, src: bytes, src_len: u64, level: int) -> int;
+    fn uncompress(dest: bytes, dest_len: bytes, src: bytes, src_len: u64) -> int;
 }
 
 pub const Z_OK: int = 0;
@@ -35,8 +34,6 @@ pub const Z_DATA_ERROR: int = -3;
 pub const Z_MEM_ERROR: int = -4;
 
 pub const Z_BUF_ERROR: int = -5;
-
-const MASK32: int = 0xFFFFFFFF;
 
 /// The zlib the program loaded, as zlib reports it ("1.2.12").
 pub fn version() -> string {
@@ -60,7 +57,7 @@ pub fn describe(rc: int) -> string {
 
 /// CRC-32 (the gzip/zip one) of `data`, continuing from `crc` (0 to start).
 pub fn crc32_update(crc: int, data: bytes) -> int {
-    crc32(crc, data, data.len()) & MASK32
+    crc32(crc as u64, data, data.len() as u64) as int
 }
 
 pub fn crc32_of(data: bytes) -> int {
@@ -69,7 +66,7 @@ pub fn crc32_of(data: bytes) -> int {
 
 /// Adler-32 (the zlib-format one) of `data`, continuing from `adler` (1 to start).
 pub fn adler32_update(adler: int, data: bytes) -> int {
-    adler32(adler, data, data.len()) & MASK32
+    adler32(adler as u64, data, data.len() as u64) as int
 }
 
 pub fn adler32_of(data: bytes) -> int {
@@ -78,21 +75,11 @@ pub fn adler32_of(data: bytes) -> int {
 
 /// The largest output `compress` can produce for `n` input octets.
 pub fn bound(n: int) -> int {
-    compressBound(n) & MASK32
-}
-
-/// A fresh buffer of `n` zero octets for C to write into. Fresh matters: on the VM, C writing
-/// into a `b"…"` literal changes the literal itself (finding #211).
-pub fn zeros(n: int) -> bytes {
-    var z = bytes_of([0]);
-    while (z.len() < n) {
-        z = z + z;
-    }
-    z.sub_bytes(0, n)
+    compressBound(n as u64) as int
 }
 
 /// A `uLongf` cell holding `n`, little-endian.
-fn cell(n: int) -> bytes {
+pub fn cell(n: int) -> bytes {
     var a: [int] = [];
     for i in 0..8 {
         a.push((n >> (8 * i)) & 255);
@@ -114,9 +101,9 @@ pub fn compress(data: bytes, level: int) -> Result<bytes, string> {
         return Result.Err("compression level ${level} out of range (-1 to 9)");
     }
     let cap = bound(data.len());
-    let dest = zeros(cap);
+    let dest = ffi.buffer(cap);
     let len = cell(cap);
-    let rc = compress2(dest, len, data, data.len(), level);
+    let rc = compress2(dest, len, data, data.len() as u64, level);
     if (rc != Z_OK) {
         return Result.Err("compress2: ${describe(rc)}");
     }
@@ -131,9 +118,9 @@ pub fn uncompress_limit(data: bytes, size_hint: int, max_out: int) -> Result<byt
         if (cap > max_out) {
             cap = max_out;
         }
-        let dest = zeros(cap);
+        let dest = ffi.buffer(cap);
         let len = cell(cap);
-        let rc = uncompress(dest, len, data, data.len());
+        let rc = uncompress(dest, len, data, data.len() as u64);
         if (rc == Z_OK) {
             return Result.Ok(dest.sub_bytes(0, cell_value(len)));
         }

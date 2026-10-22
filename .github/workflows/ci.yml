@@ -69,11 +69,9 @@ jobs:
         run: ray test
       - name: Tests (native)
         run: ray test --native
-      # Not --release: it compiles for the runner's CPU, and on macos-14 that breaks the
-      # runtime's ring crate (finding #216).
       - name: compare and stall, native
         run: |
-          ray build --native -o rayffi src/main.ray
+          ray build --native --release -o rayffi src/main.ray
           ./rayffi version
           ./rayffi compare
           RAYLANG_THREADS=2 ./rayffi stall

@@ -2,14 +2,18 @@
 //! chunks. Every call that touches the disk is declared `blocking`: in a native binary the fiber
 //! parks while the pool thread waits for the disk, and its worker keeps running the others.
 
-import std/fs;
-import zlib;
+import std/ffi;
 
 extern "z" blocking {
     fn gzopen(path: string, mode: string) -> Option<ptr>;
     fn gzread(file: ptr, buf: bytes, len: int) -> int;
     fn gzwrite(file: ptr, buf: bytes, len: int) -> int;
     fn gzclose(file: ptr) -> int;
+}
+
+// The C library's own message for an errno.
+extern "c" {
+    fn strerror(errnum: int) -> Option<string>;
 }
 
 extern "z" {
@@ -37,24 +41,15 @@ pub fn open(path: string, mode: string) -> Result<GzFile, string> {
             Result.Ok(GzFile { handle: h, path: path, open: true })
         },
         Option.None => {
-            // Not from errno: `ffi.errno()` does not exist in a native binary (finding #210), so
-            // the reason is asked of the file system.
-            let reading = mode.starts_with("r");
-            if (reading && !fs.exists(path)) {
-                Result.Err("${path}: no such file or directory")
-            } else {
-                if (reading && fs.is_dir(path)) {
-                    Result.Err("${path}: is a directory")
-                } else {
-                    Result.Err("${path}: cannot open (mode '${mode}')")
-                }
-            }
+            // Read right away: the blocking call left the pool thread's errno in this one.
+            let e = ffi.errno();
+            Result.Err("${path}: ${strerror(e).unwrap_or("cannot open (mode '${mode}')")}")
         },
     }
 }
 
 fn error_of(f: GzFile, what: string) -> string {
-    let code = bytes_of([0, 0, 0, 0]);
+    let code = ffi.buffer(4);
     let msg = gzerror(f.handle, code).unwrap_or("");
     "${f.path}: ${what}: ${msg}"
 }
@@ -64,7 +59,7 @@ pub fn read(f: GzFile, n: int) -> Result<bytes, string> {
     if (!f.open) {
         return Result.Err("${f.path}: read after close");
     }
-    let buf = zlib.zeros(n);
+    let buf = ffi.buffer(n);
     let got = gzread(f.handle, buf, n);
     if (got < 0) {
         return Result.Err(error_of(f, "read"));

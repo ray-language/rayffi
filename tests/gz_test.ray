@@ -85,7 +85,7 @@ fn errors_are_values() {
     let missing = gz.open("${dir}/nope.gz", "rb");
     match (missing) {
         Result.Ok(_) => panic("opened a missing file"),
-        Result.Err(e) => assert(e.contains("no such file")),
+        Result.Err(e) => assert(e.to_lower().contains("no such file")),
     }
     // A corrupt gzip: the header is right, the rest is not.
     fs.write_file_bytes("${dir}/bad.gz", bytes_of([0x1F, 0x8B, 8, 0, 0, 0, 0, 0, 0, 3, 0xFF, 0xFF, 0xFF, 0xFF]))
@@ -103,18 +103,16 @@ fn errors_are_values() {
 }
 
 @test
-fn errno_is_readable_or_says_why_not() {
-    // §13: `ffi.errno()` right after the failing call. In a native binary it is a stub that
-    // panics (finding #210); this test records which of the two happened.
+fn a_failed_open_says_why() {
+    // The reason comes from errno (read right after gzopen) and the C library's strerror.
     let dir = tmp();
-    let r = try_call(fn() -> int {
-        gz.open("${dir}/missing.gz", "rb");
-        ffi.errno()
-    });
-    match (r) {
-        // gz.open makes more calls after gzopen (fs.exists), so only "set" is certain.
-        Result.Ok(e) => assert(e >= 0),
-        Result.Err(msg) => assert(msg.contains("not supported") || msg.contains("errno")),
+    match (gz.open("${dir}/missing.gz", "rb")) {
+        Result.Ok(_) => panic("opened a missing file"),
+        Result.Err(e) => assert(e.contains("missing.gz: ") && e.to_lower().contains("no such file")),
+    }
+    match (gz.open("${dir}/no/such/dir/x.gz", "wb")) {
+        Result.Ok(_) => panic("created a file in a missing directory"),
+        Result.Err(e) => assert(e.to_lower().contains("no such file")),
     }
     fs.remove_all(dir);
 }

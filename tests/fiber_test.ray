@@ -23,9 +23,8 @@ fn many_fibers_call_zlib_at_once() {
 
 @test
 fn each_fiber_owns_its_handle() {
-    // The pattern that works everywhere: the fiber that uses a gzFile opens it. A ptr does not
-    // leave its fiber in a native binary, not through a channel and not captured by spawn,
-    // not even with spawn_local (finding #214); on the VM it would.
+    // Each fiber opens the gzFile it uses: a handle is not shared, so no fiber can close it
+    // under another one.
     let dir = fs.make_temp_dir("rayffi-test").unwrap();
     let done: Channel<int> = Channel.new();
     for i in 0..4 {

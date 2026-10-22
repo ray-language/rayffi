@@ -3,15 +3,16 @@
 //! share that worker (the ticker among them) wait; with `extern … blocking` the call goes to the
 //! blocking pool and the fiber parks.
 //!
-//! The two sides call different symbols, `compress` and `compress2`, because one C function
-//! cannot be declared both ways: extern names are global to the program (finding #212).
+//! Both sides call the same C function, `compress2`: declared plain here, and `blocking` in the
+//! zlib module (an extern belongs to the module that declares it).
 
 import std/time;
 import std/crypto;
+import std/ffi;
 import zlib;
 
 extern "z" {
-    fn compress(dest: bytes, dest_len: bytes, src: bytes, src_len: int) -> int;
+    fn compress2(dest: bytes, dest_len: bytes, src: bytes, src_len: u64, level: int) -> int;
 }
 
 pub struct Report {
@@ -21,14 +22,6 @@ pub struct Report {
     total_ms: int,
     worst_tick_ms: int,
     ok: bool,
-}
-
-fn cell(n: int) -> bytes {
-    var a: [int] = [];
-    for i in 0..8 {
-        a.push((n >> (8 * i)) & 255);
-    }
-    bytes_of(a)
 }
 
 fn ticker(stop: Channel<int>, out: Channel<int>) {
@@ -53,15 +46,15 @@ fn work(blocking: bool, size: int, ready: Channel<int>, go: Channel<int>, done: 
     // Incompressible input: zlib has to work for it.
     let src = crypto.random_bytes(size);
     let cap = zlib.bound(size);
-    let dest = zlib.zeros(cap);
-    let len = cell(cap);
+    let dest = ffi.buffer(cap);
+    let len = zlib.cell(cap);
     send(ready, 1);
     recv(go);
     let ok = if (blocking) {
-        // zlib.compress → compress2, declared blocking.
+        // zlib.compress → its compress2, declared blocking.
         zlib.compress(src, 6).is_ok()
     } else {
-        compress(dest, len, src, size) == zlib.Z_OK
+        compress2(dest, len, src, size as u64, 6) == zlib.Z_OK
     };
     send(done, ok);
 }

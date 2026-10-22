@@ -52,11 +52,6 @@ fn positional(a: [string], with_value: [string]) -> [string] {
     out
 }
 
-// A named wrapper: `parse_int` itself as a value does not compile to native (finding #213).
-fn number(s: string) -> Option<int> {
-    parse_int(s)
-}
-
 fn level_flag(a: [string]) -> int {
     var level = 6;
     for x in a {
@@ -197,7 +192,7 @@ fn sample() -> bytes {
 
 fn cmd_compare(a: [string]) -> int {
     let files = positional(a, ["-l"]);
-    let level = option(a, "-l").and_then(number).unwrap_or(6);
+    let level = option(a, "-l").and_then(parse_int).unwrap_or(6);
     let data = if (files.len() > 0) {
         match (fs.read_file_bytes(files[0])) {
             Result.Ok(b) => b,
@@ -218,8 +213,8 @@ fn cmd_compare(a: [string]) -> int {
 }
 
 fn cmd_stall(a: [string]) -> int {
-    let fibers = option(a, "-f").and_then(number).unwrap_or(8);
-    let mib = option(a, "-m").and_then(number).unwrap_or(8);
+    let fibers = option(a, "-f").and_then(parse_int).unwrap_or(8);
+    let mib = option(a, "-m").and_then(parse_int).unwrap_or(8);
     print(
         "${fibers} fibers each compress ${mib} MiB of random octets; a ticker fiber wants every 1 ms:"
     );
