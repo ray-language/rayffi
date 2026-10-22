@@ -7,12 +7,12 @@ y descomprime gzip en streaming con la API `gz*`, calcula CRC-32 y Adler-32, y m
 
 ```
 $ rayffi gzip big.txt
-big.txt → big.txt.gz: 64503480 → 17583755 octets in 1614 ms
+big.txt → big.txt.gz: 65007324 → 17722817 octets in 1678 ms
 
 $ RAYLANG_THREADS=2 rayffi stall
 8 fibers each compress 8 MiB of random octets; a ticker fiber wants every 1 ms:
-extern          8 fibers on 2 workers: 492 ms in all, longest tick gap 493 ms
-extern blocking  8 fibers on 2 workers: 160 ms in all, longest tick gap 2 ms
+extern          8 fibers on 2 workers: 495 ms in all, longest tick gap 495 ms
+extern blocking  8 fibers on 2 workers: 161 ms in all, longest tick gap 2 ms
 ```
 
 ```
@@ -54,29 +54,31 @@ Así es la FFI de raylang vista desde zlib:
 
 ## Rendimiento
 
-MacBook (Apple Silicon, 10 núcleos), binario nativo `--release`, zlib 1.2.12 del sistema.
+MacBook (Apple Silicon, 10 núcleos), binario nativo `--release` de raylang 1.27.76, zlib 1.2.12 del
+sistema. Con 1.27.65 las cifras eran las mismas, dentro del ruido.
 
-`rayffi gzip` contra `gzip -6` sobre 64,5 MB de texto: los dos tardan 1,6 s y dan el mismo tamaño
-(17,58 MB; difieren en los 8 octetos de la cabecera). Es la misma zlib, y llamarla desde raylang
+`rayffi gzip` contra `gzip -6` sobre 65 MB de texto (las fuentes de las apps y
+`/usr/share/dict/words`, doce veces): los dos tardan 1,7 s y dan el mismo tamaño (17,72 MB;
+difieren en los 8 octetos de la cabecera). Es la misma zlib, y llamarla desde raylang
 cuesta lo mismo que desde C. `gunzip` tarda 90 ms y `crc` 20 ms.
 
 `rayffi compare` sobre 8 MiB de texto generado:
 
 | | zlib (FFI) | stdlib |
 |---|---:|---:|
-| comprimir, nivel 6 | 139 ms · 1 344 803 octetos | 170 ms · 1 344 084 octetos (`std/deflate`, miniz_oxide) |
-| descomprimir | 5 ms | 10 ms (`std/inflate`) |
+| comprimir, nivel 6 | 141 ms · 1 344 803 octetos | 177 ms · 1 344 084 octetos (`std/deflate`, miniz_oxide) |
+| descomprimir | 5 ms | 11 ms (`std/inflate`) |
 | crc32 | < 1 ms | 19 ms |
-| gzip a archivo y leerlo con el otro | 142 ms · leído por la stdlib en 28 ms | 186 ms · leído por zlib en 10 ms |
+| gzip a archivo y leerlo con el otro | 145 ms · leído por la stdlib en 30 ms | 197 ms · leído por zlib en 8 ms |
 
 `rayffi stall`: 8 fibras comprimen 8 MiB aleatorios cada una mientras otra fibra intenta despertar
 cada milisegundo.
 
 | workers | extern normal | extern blocking |
 |---:|---|---|
-| 1 (4 fibras) | 483 ms en total, pausa máxima 483 ms | 128 ms, pausa máxima 2 ms |
-| 2 | 492 ms, pausa máxima 493 ms | 160 ms, pausa máxima 2 ms |
-| 11 | 161 ms, pausa máxima 2 ms | 176 ms, pausa máxima 2 ms |
+| 1 (4 fibras) | 475 ms en total, pausa máxima 475 ms | 133 ms, pausa máxima 2 ms |
+| 2 | 495 ms, pausa máxima 495 ms | 161 ms, pausa máxima 2 ms |
+| 11 | 169 ms, pausa máxima 3 ms | 168 ms, pausa máxima 2 ms |
 
 Con pocos workers, la llamada normal retiene el suyo y todo lo que vive en él espera. `blocking` la
 manda al pool: el ticker no se entera y, además, las compresiones corren en paralelo. Con un worker
@@ -96,7 +98,7 @@ make stall         # el experimento con 1, 2 y todos los workers
 
 | Qué | Estado |
 |---|---|
-| zlib, gzip, comparación, fibras | **16 tests** en VM y nativo (raylang 1.27.73, macOS) |
+| zlib, gzip, comparación, fibras | **16 tests** en VM y nativo (raylang 1.27.76, macOS) |
 | macOS en CI | tests en VM y nativo, y el binario con `--release` (con raylang 1.27.65 no compilaba en el runner `macos-14`, #216) |
 | Linux | en CI (el binario nativo necesita `zlib1g-dev` al compilar, #215) |
 | Windows | solo `ray check`: el runner no trae zlib. raylang ya deja nombrarla por sistema (`extern "z" windows "zlib1"`) |
@@ -107,9 +109,9 @@ límite es 6), así que quedaría como `bytes` con offsets a mano.
 
 ## Hallazgos de dogfood
 
-En `findings/` del directorio de las apps (`open/rayffi-1.27.65.md`, y la re-medición en
-`open/rayffi-1.27.73.md`). Con raylang 1.27.73 quedaron arreglados los siete primeros, y rayffi
-dejó los rodeos:
+En `findings/` del directorio de las apps (`closed/2026-10/rayffi-1.27.65.md` y
+`closed/2026-10/rayffi-1.27.73.md`, con las re-mediciones de 1.27.75 y 1.27.76). Con raylang 1.27.73
+quedaron arreglados los siete primeros, y rayffi dejó los rodeos:
 
 1. **#209 [B]** ✅ `u64` en un `extern` funcionaba en la VM, pero el nativo no compilaba («not
    marshalable: UInt(64)»). rayffi enmascaraba un `int` a 32 bits.
@@ -124,11 +126,12 @@ dejó los rodeos:
    pánico en el runtime nativo.
 7. **#215 [D]** ✅ §13 decía «dlopen at runtime», pero el nativo enlaza con `-l<nombre>`; no había
    nombre por sistema ni forma de saber si una biblioteca está.
-8. **#216 [B]** `ray build --native --release` compilaba para la CPU de la máquina y en el runner
+8. **#216 [B]** ✅ `ray build --native --release` compilaba para la CPU de la máquina y en el runner
    `macos-14` rompía el crate `ring`. 1.27.73 ya no anuncia `+native`; el CI vuelve a usar
-   `--release` para comprobarlo.
-9. **#228 [B]** (con 1.27.73) `ray check` acepta `b[i] = v` sobre un `bytes`, y luego la VM se cae con
-   un error interno y el nativo no compila.
+   `--release` y pasa.
+9. **#228 [B]** ✅ Hasta 1.27.75, `ray check` aceptaba `b[i] = v` sobre un `bytes`, y luego la VM se
+   caía con un error interno y el nativo no compilaba. Desde 1.27.76 es un error de tipos («bytes are
+   immutable»), y `bytes_of` sobre un `[int]`, lo que ya hacía rayffi, es la forma documentada.
 
 Lo que salió bien:
 
